@@ -39,7 +39,21 @@ sudo make install
 
 ## First-run setup
 
-Run the interactive wizard after installing:
+Fast path (recommended, one command):
+
+```bash
+retypex quickstart
+```
+
+`quickstart` will:
+1. Add default Hyprland binds (`Print` and `Shift+Print`) if missing
+2. Ensure `/etc/udev/rules.d/99-uinput.rules` exists
+3. Reload udev and fix `/dev/uinput` permissions for current boot
+4. Add your user to `input` group if needed
+5. Enable and start `retypexd`
+6. Reload Hyprland config (if binds were added)
+
+Interactive wizard is still available:
 
 ```bash
 retypex setup
@@ -51,7 +65,7 @@ The wizard will:
 3. Append the `bind =` lines to your Hyprland config
 4. Create `~/.config/retypex/config` if it does not exist
 
-Then apply permissions and start the daemon:
+Manual steps (alternative to `quickstart`):
 
 ```bash
 # Add yourself to the input group (re-login required)
@@ -72,8 +86,8 @@ hyprctl reload
 
 | Action               | Default hotkey  |
 |----------------------|-----------------|
-| Convert last word    | Pause           |
-| Convert selection    | Shift + Pause   |
+| Convert last word    | Print (quickstart) / Pause (setup) |
+| Convert selection    | Shift + Print (quickstart) / Shift + Pause (setup) |
 
 Hotkeys are configured in your Hyprland config via `retypex setup` or manually.
 

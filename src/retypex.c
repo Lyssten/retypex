@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 #include "config.h"
 #include "ipc.h"
@@ -73,6 +74,24 @@ static void strip_newline(char *s) {
     size_t n = strlen(s);
     while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' '))
         s[--n] = '\0';
+}
+
+static int run_cmd(const char *cmd) {
+    int rc = system(cmd);
+    if (rc < 0) return 127;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    return 128;
+}
+
+static int run_step(const char *title, const char *cmd) {
+    printf("- %s...\n", title);
+    int rc = run_cmd(cmd);
+    if (rc == 0) {
+        printf("  OK\n");
+    } else {
+        printf("  FAILED (exit %d)\n", rc);
+    }
+    return rc;
 }
 
 static int cmd_setup(void) {
@@ -166,6 +185,100 @@ done:
     return 0;
 }
 
+static int cmd_quickstart(void) {
+    int failures = 0;
+    int relogin_required = 0;
+    int wrote_binds = 0;
+
+    printf("retypex quickstart\n");
+    printf("==================\n\n");
+
+    ensure_config_dir();
+
+    const char *hypr_config = find_hypr_config();
+    if (!hypr_config) {
+        printf("- Hyprland config: not found (skip bind auto-write)\n");
+        printf("  Add manually:\n");
+        printf("  bind = , Print, exec, retypex word\n");
+        printf("  bind = SHIFT, Print, exec, retypex sel\n");
+    } else if (binds_exist(hypr_config)) {
+        printf("- Hyprland binds: already present in %s\n", hypr_config);
+    } else {
+        write_binds(hypr_config, "", "Print", "SHIFT", "Print");
+        wrote_binds = 1;
+    }
+
+    if (run_cmd("id -nG \"$USER\" | grep -qw input >/dev/null 2>&1") != 0) {
+        if (run_step("Add user to input group",
+                     "sudo usermod -aG input \"$USER\"") == 0) {
+            relogin_required = 1;
+        } else {
+            failures++;
+        }
+    } else {
+        printf("- input group membership: OK\n");
+    }
+
+    if (run_step("Ensure /etc/udev/rules.d/99-uinput.rules",
+                 "sh -c 'if [ -f /etc/udev/rules.d/99-uinput.rules ]; then exit 0; "
+                 "elif [ -f /usr/lib/udev/rules.d/99-uinput.rules ]; then "
+                 "sudo install -Dm644 /usr/lib/udev/rules.d/99-uinput.rules "
+                 "/etc/udev/rules.d/99-uinput.rules; "
+                 "elif [ -f /usr/share/retypex/99-uinput.rules ]; then "
+                 "sudo install -Dm644 /usr/share/retypex/99-uinput.rules "
+                 "/etc/udev/rules.d/99-uinput.rules; "
+                 "else "
+                 "printf \"%s\\n\" "
+                 "\"KERNEL==\\\"uinput\\\", GROUP=\\\"input\\\", MODE=\\\"0660\\\", "
+                 "OPTIONS+=\\\"static_node=uinput\\\"\" | "
+                 "sudo tee /etc/udev/rules.d/99-uinput.rules >/dev/null; "
+                 "fi'") != 0) {
+        failures++;
+    }
+
+    if (run_step("Load uinput module",
+                 "sudo modprobe uinput >/dev/null 2>&1 || true") != 0) {
+        failures++;
+    }
+    if (run_step("Reload udev rules",
+                 "sudo udevadm control --reload-rules && "
+                 "sudo udevadm trigger --name-match=uinput >/dev/null 2>&1 || "
+                 "sudo udevadm trigger >/dev/null 2>&1") != 0) {
+        failures++;
+    }
+    if (run_step("Fix /dev/uinput mode for current boot",
+                 "sh -c '[ -e /dev/uinput ] && "
+                 "sudo chgrp input /dev/uinput && sudo chmod 0660 /dev/uinput || true'") != 0) {
+        failures++;
+    }
+
+    if (run_step("Enable/start retypexd service",
+                 "systemctl --user daemon-reload && "
+                 "systemctl --user enable --now retypexd") != 0) {
+        failures++;
+    }
+
+    if (wrote_binds) {
+        if (run_step("Reload Hyprland config",
+                     "hyprctl reload >/dev/null 2>&1 || true") != 0) {
+            failures++;
+        }
+    }
+
+    printf("\nResult:\n");
+    if (failures == 0) {
+        printf("  quickstart finished successfully.\n");
+    } else {
+        printf("  quickstart finished with %d failed step(s).\n", failures);
+    }
+    if (relogin_required) {
+        printf("  Re-login required (input group was updated).\n");
+    }
+    printf("  Check daemon: systemctl --user status retypexd\n");
+    printf("  Test hotkeys: Print (word), Shift+Print (selection)\n");
+    return failures ? 1 : 0;
+}
+
 /* ------------------------------------------------------------------- main */
 
 static void usage(void) {
@@ -174,6 +287,7 @@ static void usage(void) {
             "Commands:\n"
             "  word   Convert last typed word to opposite layout\n"
             "  sel    Convert selected text to opposite layout\n"
+            "  quickstart  One-command first-run setup (recommended)\n"
             "  setup  Interactive first-run configuration wizard\n"
             "  quit   Stop the daemon\n");
 }
@@ -182,6 +296,7 @@ int main(int argc, char *argv[]) {
     if (argc < 2) { usage(); return 1; }
 
     if (strcmp(argv[1], "setup") == 0) return cmd_setup();
+    if (strcmp(argv[1], "quickstart") == 0) return cmd_quickstart();
 
     const char *cmd;
     if      (strcmp(argv[1], "word") == 0) cmd = IPC_CMD_WORD;
