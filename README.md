@@ -125,6 +125,10 @@ Hyprland bind ──► retypex word/sel ──────► retypexd (Unix so
                                     hyprctl switchxkblayout all next
 ```
 
+## Maintainers
+
+Maintenance workflow for GitHub + AUR is documented in [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
+
 ## Troubleshooting
 
 **retypexd: no keyboard devices found**
