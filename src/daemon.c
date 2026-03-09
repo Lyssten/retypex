@@ -21,6 +21,8 @@
 
 static volatile int running = 1;
 static int          uinput_fd = -1;
+static int          kbd_fds[MAX_KEYBOARDS];
+static int          n_kbd = 0;
 
 /* physical modifier state */
 static bool shift_held = false;
@@ -117,10 +119,13 @@ static void convert_word(void) {
         const KeyEntry *keys = buf_keys(&word_buf);
 
         uinput_emit_backspace(uinput_fd, len);
+        usleep(10000);   /* 10ms — let app finish processing backspaces */
         switch_layout();
-        usleep(30000);
-        for (int i = 0; i < len; i++)
+        usleep(50000);   /* 50ms — wait for layout to propagate */
+        for (int i = 0; i < len; i++) {
             uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
+            usleep(3000);
+        }
 
     } else if (last_word.len > 0) {
         /* cursor is after trailing separators: "word   |" */
@@ -128,12 +133,17 @@ static void convert_word(void) {
         const KeyEntry *keys = buf_keys(&last_word);
 
         uinput_emit_backspace(uinput_fd, trail_count + len);
+        usleep(10000);
         switch_layout();
-        usleep(30000);
-        for (int i = 0; i < len; i++)
+        usleep(50000);
+        for (int i = 0; i < len; i++) {
             uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
-        for (int i = 0; i < trail_count; i++)
+            usleep(3000);
+        }
+        for (int i = 0; i < trail_count; i++) {
             uinput_emit_key(uinput_fd, trail_codes[i], false);
+            usleep(3000);
+        }
     }
 }
 
@@ -175,13 +185,41 @@ static void convert_selection(void) {
     free(converted);
 }
 
+/* forward declaration for drain_kbd_events */
+static void handle_key_event(const struct input_event *ie);
+
 /* -------------------------------------------------------------------  IPC */
+
+/*
+ * Drain any pending keyboard events so word buffers are fully up-to-date
+ * before we act on an IPC command.  Fixes race where the IPC arrives
+ * before the last few key events in the same epoll batch.
+ */
+static void drain_kbd_events(void) {
+    struct input_event ie;
+    for (int i = 0; i < n_kbd; i++)
+        while (read(kbd_fds[i], &ie, sizeof(ie)) == sizeof(ie))
+            if (ie.type == EV_KEY) handle_key_event(&ie);
+}
 
 static void handle_ipc_cmd(int client_fd) {
     char buf[IPC_BUF_SIZE];
     if (ipc_recv(client_fd, buf, sizeof(buf)) < 0) { close(client_fd); return; }
 
-    if      (strcmp(buf, IPC_CMD_WORD) == 0) convert_word();
+    drain_kbd_events();
+
+    if      (strcmp(buf, IPC_CMD_WORD) == 0) {
+        /*
+         * Short retry window for "convert on first press" reliability.
+         * On some systems IPC may still beat the latest key event by a few ms.
+         */
+        for (int i = 0; i < 3; i++) {
+            if (word_buf.len > 0 || last_word.len > 0) break;
+            usleep(5000);
+            drain_kbd_events();
+        }
+        convert_word();
+    }
     else if (strcmp(buf, IPC_CMD_SEL)  == 0) convert_selection();
     else if (strcmp(buf, IPC_CMD_QUIT) == 0) running = 0;
 
@@ -268,8 +306,7 @@ int main(void) {
         }
     }
 
-    int kbd_fds[MAX_KEYBOARDS];
-    int n_kbd = evdev_open_keyboards(kbd_fds, MAX_KEYBOARDS);
+    n_kbd = evdev_open_keyboards(kbd_fds, MAX_KEYBOARDS);
     if (n_kbd == 0) {
         fprintf(stderr, "retypexd: no keyboard devices found — "
                         "are you in the 'input' group?\n");
@@ -314,16 +351,20 @@ int main(void) {
             perror("epoll_wait");
             break;
         }
+        /* Process keyboard events first so word buffers are current */
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
-            if (fd == ipc_fd) {
-                int client = ipc_server_accept(ipc_fd);
-                if (client >= 0) handle_ipc_cmd(client);
-                continue;
-            }
+            if (fd == ipc_fd) continue;
             struct input_event ie;
             while (read(fd, &ie, sizeof(ie)) == sizeof(ie))
                 if (ie.type == EV_KEY) handle_key_event(&ie);
+        }
+        /* Then handle IPC commands with up-to-date buffers */
+        for (int i = 0; i < n; i++) {
+            if (events[i].data.fd == ipc_fd) {
+                int client = ipc_server_accept(ipc_fd);
+                if (client >= 0) handle_ipc_cmd(client);
+            }
         }
     }
 

@@ -104,8 +104,14 @@ static int is_ru_cp(uint32_t cp) {
     return (cp >= 0x0410 && cp <= 0x044F) || cp == 0x0401 || cp == 0x0451;
 }
 
-static int is_en_letter(uint32_t cp) {
-    return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z');
+/* True if cp is any character that appears in the EN side of our mapping tables */
+static int is_en_mapped(uint32_t cp) {
+    if (cp > 0x7F) return 0;
+    for (int i = 0; i < NELEM(RU_LC); i++)
+        if ((uint32_t)(unsigned char)RU_LC[i].en == cp) return 1;
+    for (int i = 0; i < NELEM(RU_UC); i++)
+        if ((uint32_t)(unsigned char)RU_UC[i].en == cp) return 1;
+    return 0;
 }
 
 int layout_detect(const char *utf8) {
@@ -114,7 +120,7 @@ int layout_detect(const char *utf8) {
     uint32_t cp;
     while ((cp = utf8_next(&s)) != 0) {
         if (is_ru_cp(cp)) ru++;
-        else if (is_en_letter(cp)) en++;
+        else if (is_en_mapped(cp)) en++;
     }
     return (ru >= en) ? 1 : 0;
 }
@@ -155,7 +161,7 @@ char *layout_convert(const char *utf8) {
         if (dir == 1 && is_ru_cp(cp)) {
             char en = ru_cp_to_en(cp);
             if (en) { out[oi++] = en; continue; }
-        } else if (dir == 0 && is_en_letter(cp)) {
+        } else if (dir == 0 && is_en_mapped(cp)) {
             char ru[4];
             int n = en_char_to_ru((char)cp, ru);
             if (n > 0) { memcpy(out + oi, ru, n); oi += n; continue; }

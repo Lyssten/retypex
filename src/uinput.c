@@ -71,6 +71,7 @@ void uinput_emit_backspace(int fd, int count) {
     for (int i = 0; i < count; i++) {
         _emit(fd, EV_KEY, KEY_BACKSPACE, 1); syn(fd);
         _emit(fd, EV_KEY, KEY_BACKSPACE, 0); syn(fd);
+        usleep(3000);  /* 3ms — let compositor process each backspace */
     }
 }
 

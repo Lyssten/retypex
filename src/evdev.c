@@ -23,6 +23,12 @@ static int is_keyboard(int fd) {
     if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) < 0)
         return 0;
 
+    /* skip our own virtual keyboard to avoid self-feedback */
+    char name[256] = {0};
+    if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 &&
+        strstr(name, "retypex") != NULL)
+        return 0;
+
     /* Must have KEY_SPACE and at least some letter keys */
     return test_bit(keys, KEY_SPACE) && test_bit(keys, KEY_A);
 }
