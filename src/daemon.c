@@ -14,17 +14,30 @@
 #include "uinput.h"
 #include "layout.h"
 
-#define MAX_EVENTS 64
+#define MAX_EVENTS  64
+#define TRAIL_MAX  100
 
 static volatile int running = 1;
 static int          uinput_fd = -1;
-static WordBuffer   word_buf;
-static bool         shift_held = false;
-static bool         ctrl_held  = false;
+
+/* physical modifier state */
+static bool shift_held = false;
+static bool ctrl_held  = false;
+
+/*
+ * Word tracking:
+ *   word_buf   — keys of the word currently being typed
+ *   last_word  — keys of the last completed word (before trailing separators)
+ *   trail_*    — separator key codes typed after last_word (spaces, tabs…)
+ */
+static WordBuffer word_buf;
+static WordBuffer last_word;
+static uint16_t   trail_codes[TRAIL_MAX];
+static int        trail_count = 0;
 
 static void sig_handler(int sig) { (void)sig; running = 0; }
 
-/* ------------------------------------------------------------------ helpers */
+/* ----------------------------------------------------------------- layout */
 
 static void switch_layout(void) {
     char cmd[128];
@@ -34,110 +47,147 @@ static void switch_layout(void) {
     system(cmd);
 }
 
+/* -------------------------------------------------------------- conversion */
+
 static void convert_word(void) {
-    int len = buf_len(&word_buf);
-    if (len == 0) return;
+    if (word_buf.len > 0) {
+        /* cursor is inside or at end of current word */
+        int len = word_buf.len;
+        const KeyEntry *keys = buf_keys(&word_buf);
 
-    const KeyEntry *keys = buf_keys(&word_buf);
+        uinput_emit_backspace(uinput_fd, len);
+        switch_layout();
+        usleep(30000);
+        for (int i = 0; i < len; i++)
+            uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
 
-    /* 1. delete the word */
-    uinput_emit_backspace(uinput_fd, len);
+    } else if (last_word.len > 0) {
+        /* cursor is after trailing separators (e.g. typed "word  |") */
+        int len = last_word.len;
+        const KeyEntry *keys = buf_keys(&last_word);
 
-    /* 2. switch layout */
-    switch_layout();
-
-    /* 3. wait for compositor to process layout change */
-    usleep(30000);
-
-    /* 4. re-emit same key codes — new layout interprets them differently */
-    for (int i = 0; i < len; i++)
-        uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
-
-    /* buffer unchanged: same key codes, pressing hotkey again toggles back */
+        uinput_emit_backspace(uinput_fd, trail_count + len);
+        switch_layout();
+        usleep(30000);
+        for (int i = 0; i < len; i++)
+            uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
+        for (int i = 0; i < trail_count; i++)
+            uinput_emit_key(uinput_fd, trail_codes[i], false);
+    }
+    /* buffer intentionally unchanged — hotkey again toggles back */
 }
 
 static void convert_selection(void) {
-    /* save current clipboard */
+    /* save current clipboard so we can restore it */
     char saved[65536] = {0};
     FILE *f = popen("wl-paste --no-newline 2>/dev/null", "r");
     if (f) { fread(saved, 1, sizeof(saved) - 1, f); pclose(f); }
 
-    /* copy selection */
-    uinput_emit_ctrl_key(uinput_fd, KEY_C);
-    usleep(100000);
-
-    /* read selection from clipboard */
+    /*
+     * Read selected text from the PRIMARY selection.
+     * On Wayland, highlighted text lands in PRIMARY automatically — no
+     * Ctrl+C needed, so no timing/modifier issues.
+     */
     char selected[65536] = {0};
-    f = popen("wl-paste --no-newline 2>/dev/null", "r");
+    f = popen("wl-paste --primary --no-newline 2>/dev/null", "r");
     if (!f) return;
     fread(selected, 1, sizeof(selected) - 1, f);
     pclose(f);
 
     if (selected[0] == '\0') return;
 
-    /* convert */
     char *converted = layout_convert(selected);
     if (!converted) return;
 
-    /* write converted to clipboard */
+    /* put converted text on the clipboard */
     FILE *w = popen("wl-copy", "w");
     if (w) { fputs(converted, w); pclose(w); }
     free(converted);
 
-    /* paste */
-    uinput_emit_ctrl_key(uinput_fd, KEY_V);
-    usleep(100000);
+    /* small pause for the clipboard to be set */
+    usleep(20000);
 
-    /* restore original clipboard */
-    w = popen("wl-copy", "w");
-    if (w) { fputs(saved, w); pclose(w); }
+    /* paste — virtual keyboard has no held modifiers, so Ctrl+V is clean */
+    uinput_emit_ctrl_key(uinput_fd, KEY_V);
+
+    /* restore original clipboard after paste completes */
+    usleep(150000);
+    if (saved[0] != '\0') {
+        w = popen("wl-copy", "w");
+        if (w) { fputs(saved, w); pclose(w); }
+    } else {
+        system("wl-copy --clear 2>/dev/null");
+    }
 }
 
-/* ----------------------------------------------------------------- ipc */
+/* -------------------------------------------------------------------  IPC */
 
 static void handle_ipc_cmd(int client_fd) {
     char buf[IPC_BUF_SIZE];
-    if (ipc_recv(client_fd, buf, sizeof(buf)) < 0) return;
+    if (ipc_recv(client_fd, buf, sizeof(buf)) < 0) { close(client_fd); return; }
 
-    if (strcmp(buf, IPC_CMD_WORD) == 0) {
-        convert_word();
-    } else if (strcmp(buf, IPC_CMD_SEL) == 0) {
-        convert_selection();
-    } else if (strcmp(buf, IPC_CMD_QUIT) == 0) {
-        running = 0;
-    }
+    if      (strcmp(buf, IPC_CMD_WORD) == 0) convert_word();
+    else if (strcmp(buf, IPC_CMD_SEL)  == 0) convert_selection();
+    else if (strcmp(buf, IPC_CMD_QUIT) == 0) running = 0;
 
     close(client_fd);
 }
 
-/* ----------------------------------------------------------------- evdev */
+/* ------------------------------------------------------------------ evdev */
 
 static void handle_key_event(const struct input_event *ie) {
     uint16_t code  = ie->code;
-    int32_t  value = ie->value; /* 0=up, 1=down, 2=repeat */
+    int32_t  value = ie->value;
 
-    /* track modifier state */
-    if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT)
+    if (code == KEY_LEFTSHIFT  || code == KEY_RIGHTSHIFT)
         shift_held = (value != 0);
-    if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL)
-        ctrl_held = (value != 0);
+    if (code == KEY_LEFTCTRL   || code == KEY_RIGHTCTRL)
+        ctrl_held  = (value != 0);
 
-    /* only care about press/repeat for buffer updates */
     if (value != 1 && value != 2) return;
 
     if (code == KEY_BACKSPACE) {
-        buf_pop(&word_buf);
-    } else if (evdev_is_separator(code) || ctrl_held) {
+        if (word_buf.len > 0)
+            buf_pop(&word_buf);
+        else if (trail_count > 0)
+            trail_count--;
+
+    } else if (ctrl_held || code == KEY_DELETE) {
+        /* ctrl combos or Delete break word context entirely */
         buf_clear(&word_buf);
+        buf_clear(&last_word);
+        trail_count = 0;
+
+    } else if (evdev_is_separator(code)) {
+        /*
+         * Separator after a word: archive word_buf → last_word, reset trail.
+         * Separator after separators: just keep accumulating trail.
+         */
+        if (word_buf.len > 0) {
+            last_word   = word_buf;  /* struct copy */
+            buf_clear(&word_buf);
+            trail_count = 0;
+        }
+        if (trail_count < TRAIL_MAX)
+            trail_codes[trail_count++] = code;
+
     } else if (evdev_is_nav_key(code)) {
-        /* cursor moved — buffer out of sync */
+        /* cursor moved — buffer no longer represents screen state */
         buf_clear(&word_buf);
+        buf_clear(&last_word);
+        trail_count = 0;
+
     } else if (evdev_is_char_key(code)) {
+        if (trail_count > 0) {
+            /* starting a brand-new word; previous last_word is unreachable */
+            buf_clear(&last_word);
+            trail_count = 0;
+        }
         buf_push(&word_buf, code, shift_held);
     }
 }
 
-/* ================================================================= main == */
+/* ================================================================== main == */
 
 int main(void) {
     signal(SIGINT,  sig_handler);
@@ -145,48 +195,52 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
     config_load();
+    const char *sock_path = config_socket_path();
 
-    /* open keyboards */
+    /* single-instance guard: try connecting to an existing socket */
+    {
+        int probe = ipc_client_connect(sock_path);
+        if (probe >= 0) {
+            fprintf(stderr, "retypexd: already running (socket: %s)\n", sock_path);
+            close(probe);
+            return 1;
+        }
+    }
+
     int kbd_fds[MAX_KEYBOARDS];
     int n_kbd = evdev_open_keyboards(kbd_fds, MAX_KEYBOARDS);
     if (n_kbd == 0) {
-        fprintf(stderr, "retypexd: no keyboard devices found. "
-                        "Are you in the 'input' group?\n");
+        fprintf(stderr, "retypexd: no keyboard devices found — "
+                        "are you in the 'input' group?\n");
         return 1;
     }
     fprintf(stderr, "retypexd: monitoring %d keyboard(s)\n", n_kbd);
 
-    /* create virtual output keyboard */
     uinput_fd = uinput_open();
     if (uinput_fd < 0) {
-        fprintf(stderr, "retypexd: failed to open uinput. "
-                        "Check /etc/udev/rules.d/99-uinput.rules\n");
+        fprintf(stderr, "retypexd: failed to open uinput — "
+                        "check /etc/udev/rules.d/99-uinput.rules\n");
         return 1;
     }
 
-    /* IPC server */
-    const char *sock_path = config_socket_path();
     int ipc_fd = ipc_server_create(sock_path);
     if (ipc_fd < 0) return 1;
 
     buf_init(&word_buf);
+    buf_init(&last_word);
 
-    /* epoll */
     int epfd = epoll_create1(0);
     if (epfd < 0) { perror("epoll_create1"); return 1; }
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-
+    struct epoll_event ev = { .events = EPOLLIN };
     ev.data.fd = ipc_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, ipc_fd, &ev);
-
     for (int i = 0; i < n_kbd; i++) {
         ev.data.fd = kbd_fds[i];
         epoll_ctl(epfd, EPOLL_CTL_ADD, kbd_fds[i], &ev);
     }
 
-    fprintf(stderr, "retypexd: ready. socket=%s\n", sock_path);
+    fprintf(stderr, "retypexd: ready — socket=%s\n", sock_path);
 
     struct epoll_event events[MAX_EVENTS];
     while (running) {
@@ -196,31 +250,23 @@ int main(void) {
             perror("epoll_wait");
             break;
         }
-
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
-
             if (fd == ipc_fd) {
                 int client = ipc_server_accept(ipc_fd);
                 if (client >= 0) handle_ipc_cmd(client);
                 continue;
             }
-
-            /* keyboard event */
             struct input_event ie;
-            while (read(fd, &ie, sizeof(ie)) == sizeof(ie)) {
-                if (ie.type == EV_KEY)
-                    handle_key_event(&ie);
-            }
+            while (read(fd, &ie, sizeof(ie)) == sizeof(ie))
+                if (ie.type == EV_KEY) handle_key_event(&ie);
         }
     }
 
-    /* cleanup */
     close(epfd);
     close(ipc_fd);
     unlink(sock_path);
     for (int i = 0; i < n_kbd; i++) close(kbd_fds[i]);
     uinput_close(uinput_fd);
-
     return 0;
 }
