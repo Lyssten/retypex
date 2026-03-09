@@ -1,5 +1,6 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -Isrc
+VERSION = 1.0.0
+CFLAGS  = -O2 -Wall -Wextra -std=c11 -D_GNU_SOURCE -DVERSION=\"$(VERSION)\" -Isrc
 PREFIX  = /usr/local
 
 DAEMON_SRCS = src/daemon.c src/evdev.c src/uinput.c \

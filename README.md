@@ -1,81 +1,101 @@
 # retypex
 
-Switch keyboard layout of the last typed word (or selected text) in any window on Wayland/Hyprland.
+Switch keyboard layout of the last typed word (or selected text) in any window on Wayland/Hyprland — without leaving your current application.
 
-## How it works
+## Features
 
-`retypexd` monitors keyboard input via evdev, maintains a buffer of the current word's key codes. On trigger:
-- **Word mode**: emits backspaces × word_len, switches layout via `hyprctl`, re-emits the same key codes
-- **Selection mode**: copies selection via clipboard, converts text, pastes back, restores clipboard
+- **Word mode**: re-types the current word in the opposite layout (RU↔EN) with a single hotkey
+- **Selection mode**: converts any highlighted text to the opposite layout
+- Works in any Wayland application — browsers, terminals, GUI apps, editors
+- Non-intrusive: reads keyboard events passively (no grab), injects output via uinput
+- Daemon architecture keeps latency minimal; CLI sends instant IPC commands
 
-## TODO
+## Requirements
 
-- [x] Project setup and architecture
-- [x] `src/config.c/h` — config file parsing
-- [x] `src/ipc.c/h` — Unix socket IPC (daemon ↔ CLI)
-- [x] `src/buffer.c/h` — word key-code buffer
-- [x] `src/layout.c/h` — RU↔EN Unicode text conversion
-- [x] `src/evdev.c/h` — keyboard device discovery and monitoring
-- [x] `src/uinput.c/h` — virtual keyboard (uinput)
-- [x] `src/daemon.c` — main daemon (epoll event loop)
-- [x] `src/retypex.c` — CLI tool (sends IPC commands)
-- [x] Makefile + build verification (0 warnings)
-- [x] `install/retypexd.service` — systemd user service
-- [x] `install/99-uinput.rules` — udev rules for /dev/uinput access
-- [ ] Test: terminal (kitty/foot), browser (Firefox), GUI apps
-- [ ] Test: mid-word cursor, mixed layouts, long words
-- [ ] Selected text conversion test
-- [ ] AUR PKGBUILD
+- Hyprland (with `hyprctl` in PATH)
+- `wl-clipboard` (`wl-paste`, `wl-copy`) — required for selection mode
+- `wtype` — **optional but recommended** for selection mode; types text natively as Wayland key events (works in terminals too); falls back to `wl-copy` + Ctrl+V if absent
+- `gcc` (build only)
+- Linux kernel headers (`linux/input.h`, `linux/uinput.h`) — present on any standard Linux system
 
-## Dependencies
+## Installation
 
-- Linux kernel headers (`linux/input.h`, `linux/uinput.h`)
-- `wl-clipboard` (`wl-paste`, `wl-copy`) — for selection mode
-- `wtype` — **recommended** for selection mode output (types text natively on Wayland, no paste shortcut needed); falls back to `wl-copy` + Ctrl+V if absent
-- `hyprland` with `hyprctl` in PATH
-
-## Setup
-
-### 1. Permissions
+### From AUR
 
 ```bash
-sudo usermod -aG input $USER
-# For uinput — either add rule (preferred) or add to group:
-sudo cp install/99-uinput.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-# Re-login for group changes to take effect
+yay -S retypex-git
+# or
+paru -S retypex-git
 ```
 
-### 2. Build and install
+### Manual build
 
 ```bash
+git clone https://github.com/GITHUB_USERNAME/retypex
+cd retypex
 make
 sudo make install
 ```
 
-### 3. Start daemon
+## First-run setup
+
+Run the interactive wizard after installing:
 
 ```bash
+retypex setup
+```
+
+The wizard will:
+1. Detect your Hyprland config file (`hyprland.conf` or `keybindings.conf`)
+2. Let you choose hotkeys (Pause, PrintScreen, or custom)
+3. Append the `bind =` lines to your Hyprland config
+4. Create `~/.config/retypex/config` if it does not exist
+
+Then apply permissions and start the daemon:
+
+```bash
+# Add yourself to the input group (re-login required)
+sudo usermod -aG input $USER
+
+# Install udev rule for /dev/uinput access
+sudo cp install/99-uinput.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Enable and start the daemon
 systemctl --user enable --now retypexd
+
+# Reload Hyprland to pick up new keybinds
+hyprctl reload
 ```
 
-### 4. Hyprland config
+## Default hotkeys
 
-Add to `~/.config/hypr/hyprland.conf`:
+| Action               | Default hotkey  |
+|----------------------|-----------------|
+| Convert last word    | Pause           |
+| Convert selection    | Shift + Pause   |
 
-```
-bind = , Pause, exec, retypex word
-bind = SHIFT, Pause, exec, retypex sel
-```
+Hotkeys are configured in your Hyprland config via `retypex setup` or manually.
 
 ## Config
 
 `~/.config/retypex/config`:
 
-```
-# Keyboard device name for hyprctl switchxkblayout (default: all)
+```ini
+# Keyboard device name passed to hyprctl switchxkblayout (default: all)
 keyboard = all
 ```
+
+Set `keyboard` to a specific device name (as shown by `hyprctl devices`) if you have multiple keyboards and only want to switch one.
+
+## How it works
+
+`retypexd` monitors raw keyboard events from `/dev/input/eventX` using evdev (no exclusive grab — other apps receive keystrokes normally). It maintains a rolling buffer of the current word's key codes.
+
+On trigger (via IPC from the `retypex` CLI):
+
+- **Word mode**: emits backspaces equal to the word length, calls `hyprctl switchxkblayout <keyboard> next`, then re-emits the same key codes — producing the word in the other layout.
+- **Selection mode**: reads the Wayland PRIMARY selection (`wl-paste --primary`), converts the text character-by-character between RU and EN layouts, then outputs the result via `wtype` (or falls back to clipboard + Ctrl+V).
 
 ## Architecture
 
@@ -90,3 +110,30 @@ Hyprland bind ──► retypex word/sel ──────► retypexd (Unix so
                                            │
                                     hyprctl switchxkblayout all next
 ```
+
+## Troubleshooting
+
+**retypexd: no keyboard devices found**
+You are not in the `input` group. Run `sudo usermod -aG input $USER` and re-login.
+
+**retypexd: failed to open uinput**
+The udev rule for `/dev/uinput` is not installed. Copy `install/99-uinput.rules` to `/etc/udev/rules.d/` and reload udev rules (see installation steps above).
+
+**Selection mode does not work in terminals**
+Install `wtype` (`sudo pacman -S wtype`). Without it, selection mode falls back to Ctrl+V paste, which does not work in terminals that use Ctrl+V for other purposes.
+
+**Nothing happens when I press the hotkey**
+- Check that the daemon is running: `systemctl --user status retypexd`
+- Check that Hyprland config has the binds: `grep retypex ~/.config/hypr/*.conf`
+- Reload Hyprland: `hyprctl reload`
+
+## TODO
+
+- [ ] Test: terminal (kitty/foot), browser (Firefox), GUI apps
+- [ ] Test: mid-word cursor, mixed layouts, long words
+- [ ] Selected text conversion end-to-end test
+- [x] AUR PKGBUILD
+
+## License
+
+MIT — see [LICENSE](LICENSE).

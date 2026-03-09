@@ -243,6 +243,19 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
     config_load();
+
+    /* first-run hint: if no config file exists yet */
+    {
+        const char *home = getenv("HOME");
+        if (home) {
+            char cfg[512];
+            snprintf(cfg, sizeof(cfg), "%s%s", home, CONFIG_FILE);
+            if (access(cfg, F_OK) != 0)
+                fprintf(stderr, "retypexd: first run — no config found. "
+                                "Run 'retypex setup' to configure keybinds.\n");
+        }
+    }
+
     const char *sock_path = config_socket_path();
 
     /* single-instance guard */
