@@ -5,6 +5,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/epoll.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <linux/input.h>
 
 #include "config.h"
@@ -35,9 +37,26 @@ static WordBuffer last_word;
 static uint16_t   trail_codes[TRAIL_MAX];
 static int        trail_count = 0;
 
+/*
+ * Selection conversion dedup:
+ *   sel_from — PRIMARY content we last converted FROM (to skip stale repeats)
+ *   sel_to   — PRIMARY content we last converted TO   (to skip if app keeps selection)
+ */
+static char sel_from[65536] = {0};
+static char sel_to[65536]   = {0};
+
 static void sig_handler(int sig) { (void)sig; running = 0; }
 
-/* ----------------------------------------------------------------- layout */
+/* ----------------------------------------------------------------- helpers */
+
+static void read_cmd(const char *cmd, char *buf, size_t size) {
+    buf[0] = '\0';
+    FILE *f = popen(cmd, "r");
+    if (!f) return;
+    size_t n = fread(buf, 1, size - 1, f);
+    buf[n] = '\0';
+    pclose(f);
+}
 
 static void switch_layout(void) {
     char cmd[128];
@@ -47,11 +66,53 @@ static void switch_layout(void) {
     system(cmd);
 }
 
+/*
+ * Type text using wtype (Wayland-native, no clipboard/paste-shortcut needed).
+ * Returns 0 on success, -1 if wtype is not installed or failed.
+ */
+static int wtype_text(const char *text) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* child: redirect stdout/stderr to /dev/null */
+        int null = open("/dev/null", O_WRONLY);
+        if (null >= 0) { dup2(null, 1); dup2(null, 2); close(null); }
+        char *argv[] = { "wtype", "--", (char *)text, NULL };
+        execvp("wtype", argv);
+        exit(127);  /* wtype not found */
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/*
+ * Paste via clipboard + Ctrl+V fallback (when wtype is unavailable).
+ * Saves and restores the original clipboard content.
+ */
+static void clipboard_paste(const char *text) {
+    char saved[65536] = {0};
+    read_cmd("wl-paste --no-newline 2>/dev/null", saved, sizeof(saved));
+
+    FILE *w = popen("wl-copy", "w");
+    if (w) { fputs(text, w); pclose(w); }
+
+    usleep(30000);
+    uinput_emit_ctrl_key(uinput_fd, KEY_V);
+    usleep(150000);
+
+    if (saved[0] != '\0') {
+        w = popen("wl-copy", "w");
+        if (w) { fputs(saved, w); pclose(w); }
+    } else {
+        system("wl-copy --clear 2>/dev/null");
+    }
+}
+
 /* -------------------------------------------------------------- conversion */
 
 static void convert_word(void) {
     if (word_buf.len > 0) {
-        /* cursor is inside or at end of current word */
         int len = word_buf.len;
         const KeyEntry *keys = buf_keys(&word_buf);
 
@@ -62,7 +123,7 @@ static void convert_word(void) {
             uinput_emit_key(uinput_fd, keys[i].code, keys[i].shift);
 
     } else if (last_word.len > 0) {
-        /* cursor is after trailing separators (e.g. typed "word  |") */
+        /* cursor is after trailing separators: "word   |" */
         int len = last_word.len;
         const KeyEntry *keys = buf_keys(&last_word);
 
@@ -74,50 +135,44 @@ static void convert_word(void) {
         for (int i = 0; i < trail_count; i++)
             uinput_emit_key(uinput_fd, trail_codes[i], false);
     }
-    /* buffer intentionally unchanged — hotkey again toggles back */
 }
 
 static void convert_selection(void) {
-    /* save current clipboard so we can restore it */
-    char saved[65536] = {0};
-    FILE *f = popen("wl-paste --no-newline 2>/dev/null", "r");
-    if (f) { fread(saved, 1, sizeof(saved) - 1, f); pclose(f); }
-
     /*
-     * Read selected text from the PRIMARY selection.
-     * On Wayland, highlighted text lands in PRIMARY automatically — no
-     * Ctrl+C needed, so no timing/modifier issues.
+     * Read PRIMARY selection.
+     * On Wayland, highlighted text is placed in PRIMARY automatically.
+     * No Ctrl+C needed — avoids all modifier/timing issues.
      */
     char selected[65536] = {0};
-    f = popen("wl-paste --primary --no-newline 2>/dev/null", "r");
-    if (!f) return;
-    fread(selected, 1, sizeof(selected) - 1, f);
-    pclose(f);
+    read_cmd("wl-paste --primary --no-newline 2>/dev/null", selected, sizeof(selected));
 
+    /* nothing selected */
     if (selected[0] == '\0') return;
+
+    /*
+     * Stale PRIMARY guard:
+     * Skip if PRIMARY content matches the last text we converted FROM
+     * or the last text we converted TO (app may keep selection after paste).
+     */
+    if (strcmp(selected, sel_from) == 0 || strcmp(selected, sel_to) == 0)
+        return;
 
     char *converted = layout_convert(selected);
     if (!converted) return;
 
-    /* put converted text on the clipboard */
-    FILE *w = popen("wl-copy", "w");
-    if (w) { fputs(converted, w); pclose(w); }
+    /* record for dedup */
+    snprintf(sel_from, sizeof(sel_from), "%s", selected);
+    snprintf(sel_to,   sizeof(sel_to),   "%s", converted);
+
+    /*
+     * Output: prefer wtype (types text directly as Wayland key events,
+     * works in all apps including terminals, no paste shortcut needed).
+     * Fall back to clipboard + Ctrl+V if wtype is not installed.
+     */
+    if (wtype_text(converted) != 0)
+        clipboard_paste(converted);
+
     free(converted);
-
-    /* small pause for the clipboard to be set */
-    usleep(20000);
-
-    /* paste — virtual keyboard has no held modifiers, so Ctrl+V is clean */
-    uinput_emit_ctrl_key(uinput_fd, KEY_V);
-
-    /* restore original clipboard after paste completes */
-    usleep(150000);
-    if (saved[0] != '\0') {
-        w = popen("wl-copy", "w");
-        if (w) { fputs(saved, w); pclose(w); }
-    } else {
-        system("wl-copy --clear 2>/dev/null");
-    }
 }
 
 /* -------------------------------------------------------------------  IPC */
@@ -153,18 +208,13 @@ static void handle_key_event(const struct input_event *ie) {
             trail_count--;
 
     } else if (ctrl_held || code == KEY_DELETE) {
-        /* ctrl combos or Delete break word context entirely */
         buf_clear(&word_buf);
         buf_clear(&last_word);
         trail_count = 0;
 
     } else if (evdev_is_separator(code)) {
-        /*
-         * Separator after a word: archive word_buf → last_word, reset trail.
-         * Separator after separators: just keep accumulating trail.
-         */
         if (word_buf.len > 0) {
-            last_word   = word_buf;  /* struct copy */
+            last_word   = word_buf;
             buf_clear(&word_buf);
             trail_count = 0;
         }
@@ -172,14 +222,12 @@ static void handle_key_event(const struct input_event *ie) {
             trail_codes[trail_count++] = code;
 
     } else if (evdev_is_nav_key(code)) {
-        /* cursor moved — buffer no longer represents screen state */
         buf_clear(&word_buf);
         buf_clear(&last_word);
         trail_count = 0;
 
     } else if (evdev_is_char_key(code)) {
         if (trail_count > 0) {
-            /* starting a brand-new word; previous last_word is unreachable */
             buf_clear(&last_word);
             trail_count = 0;
         }
@@ -197,7 +245,7 @@ int main(void) {
     config_load();
     const char *sock_path = config_socket_path();
 
-    /* single-instance guard: try connecting to an existing socket */
+    /* single-instance guard */
     {
         int probe = ipc_client_connect(sock_path);
         if (probe >= 0) {
@@ -228,6 +276,9 @@ int main(void) {
 
     buf_init(&word_buf);
     buf_init(&last_word);
+
+    /* snapshot current PRIMARY so a pre-existing selection is not auto-triggered */
+    read_cmd("wl-paste --primary --no-newline 2>/dev/null", sel_from, sizeof(sel_from));
 
     int epfd = epoll_create1(0);
     if (epfd < 0) { perror("epoll_create1"); return 1; }

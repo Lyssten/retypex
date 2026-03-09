@@ -31,6 +31,7 @@ Switch keyboard layout of the last typed word (or selected text) in any window o
 
 - Linux kernel headers (`linux/input.h`, `linux/uinput.h`)
 - `wl-clipboard` (`wl-paste`, `wl-copy`) — for selection mode
+- `wtype` — **recommended** for selection mode output (types text natively on Wayland, no paste shortcut needed); falls back to `wl-copy` + Ctrl+V if absent
 - `hyprland` with `hyprctl` in PATH
 
 ## Setup
