@@ -31,7 +31,7 @@ paru -S retypex-git
 ### Manual build
 
 ```bash
-git clone https://github.com/GITHUB_USERNAME/retypex
+git clone https://github.com/Lyssten/retypex
 cd retypex
 make
 sudo make install
